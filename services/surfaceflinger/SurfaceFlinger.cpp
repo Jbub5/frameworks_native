@@ -3327,12 +3327,12 @@ void SurfaceFlinger::onCompositionPresented(PhysicalDisplayId pacesetterId,
     }
 
     if (hasPacesetterDisplay && !pacesetterDisplay->isPoweredOn()) {
-        getRenderEngine().cleanupPostRender();
+        //getRenderEngine().cleanupPostRender();
         return;
     }
 
     // Cleanup any outstanding resources due to rendering a prior frame.
-    getRenderEngine().cleanupPostRender();
+    //getRenderEngine().cleanupPostRender();
 
     if (mNumTrustedPresentationListeners > 0) {
         // We avoid any reverse traversal upwards so this shouldn't be too expensive
