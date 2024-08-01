@@ -258,6 +258,7 @@ cc_defaults {
         "-Wunused-const-variable",
         "-DANDROID_BASE_UNIQUE_FD_DISABLE_IMPLICIT_CONVERSION",
         "-DANDROID_UTILS_REF_BASE_DISABLE_IMPLICIT_CONSTRUCTION",
+        "-O3",
     ],
 }
 
