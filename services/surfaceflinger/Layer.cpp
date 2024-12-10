@@ -77,7 +77,7 @@
 #include "Utils/FenceUtils.h"
 
 #define DEBUG_RESIZE 0
-#define EARLY_RELEASE_ENABLED false
+#define EARLY_RELEASE_ENABLED true
 
 namespace android {
 using namespace std::chrono_literals;
