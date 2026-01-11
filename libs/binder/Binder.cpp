@@ -743,9 +743,6 @@ BBinder::~BBinder()
         if (isRequestingSid()) {
             ALOGW("Binder %p destroyed when requesting SID before being parceled.", this);
         }
-        if (isInheritRt()) {
-            ALOGW("Binder %p destroyed after setInheritRt before being parceled.", this);
-        }
 #ifdef __linux__
         if (getMinSchedulerPolicy() != SCHED_NORMAL) {
             ALOGW("Binder %p destroyed after setMinSchedulerPolicy before being parceled.", this);
