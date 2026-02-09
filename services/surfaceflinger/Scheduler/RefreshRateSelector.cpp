@@ -59,13 +59,6 @@ struct RefreshRateScore {
 
 constexpr RefreshRateSelector::GlobalSignals kNoSignals;
 
-std::string formatLayerInfo(const RefreshRateSelector::LayerRequirement& layer, float weight) {
-    return base::StringPrintf("%s (type=%s, weight=%.2f, seamlessness=%s) %s", layer.name.c_str(),
-                              ftl::enum_string(layer.vote).c_str(), weight,
-                              ftl::enum_string(layer.seamlessness).c_str(),
-                              to_string(layer.desiredRefreshRate).c_str());
-}
-
 std::vector<Fps> constructKnownFrameRates(const DisplayModes& modes) {
     (void)modes;
     return {60_Hz};
