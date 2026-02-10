@@ -1008,13 +1008,6 @@ std::shared_ptr<VsyncSchedule> Scheduler::promotePacesetterDisplayLocked(
             pacesetter.selectorPtr->startIdleTimer();
         }
 
-        mHeuristicIdleTimer.emplace(
-                "heuristicIdleTimer",
-                std::max(HEURISTIC_TIMEOUT, pacesetter.selectorPtr->getIdleTimerTimeout()),
-                [this] { heuristicIdleTimerCallback(TimerState::Reset); },
-                [this] { heuristicIdleTimerCallback(TimerState::Expired); });
-        mHeuristicIdleTimer->start();
-
         newVsyncSchedulePtr = pacesetter.schedulePtr;
 
         constexpr bool kForce = true;

@@ -1021,27 +1021,15 @@ void RefreshRateSelector::dump(utils::Dumper& dumper) const {
 }
 
 std::chrono::milliseconds RefreshRateSelector::getIdleTimerTimeout() {
-    return 0ms;
+    if (FlagManager::getInstance().idle_screen_refresh_rate_timeout() && mIdleTimer) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(mIdleTimer->interval());
+    }
+    return mConfig.legacyIdleTimerTimeout;
 }
 
-// TODO(b/293651105): Extract category FpsRange mapping to OEM-configurable config.
 FpsRange RefreshRateSelector::getFrameRateCategoryRange(FrameRateCategory category) {
-    switch (category) {
-        case FrameRateCategory::High:
-            return FpsRange{kFrameRateCategoryRateHigh, 120_Hz};
-        case FrameRateCategory::Normal:
-            return FpsRange{kFrameRateCategoryRateNormal, 120_Hz};
-        case FrameRateCategory::Low:
-            return FpsRange{48_Hz, 120_Hz};
-        case FrameRateCategory::HighHint:
-        case FrameRateCategory::NoPreference:
-        case FrameRateCategory::Default:
-            LOG_ALWAYS_FATAL("Should not get fps range for frame rate category: %s",
-                             ftl::enum_string(category).c_str());
-        default:
-            LOG_ALWAYS_FATAL("Invalid frame rate category for range: %s",
-                             ftl::enum_string(category).c_str());
-    }
+    (void)category;
+    return FpsRange{60_Hz, 60_Hz};
 }
 
 } // namespace android::scheduler
