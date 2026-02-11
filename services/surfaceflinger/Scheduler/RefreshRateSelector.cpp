@@ -67,8 +67,20 @@ std::string formatLayerInfo(const RefreshRateSelector::LayerRequirement& layer, 
 }
 
 std::vector<Fps> constructKnownFrameRates(const DisplayModes& modes) {
-    (void)modes;
-    return {60_Hz};
+    std::vector<Fps> knownFrameRates = {24_Hz, 30_Hz, 45_Hz, 60_Hz, 72_Hz};
+    knownFrameRates.reserve(knownFrameRates.size() + modes.size());
+
+    // Add all supported refresh rates.
+    for (const auto& [id, mode] : modes) {
+        knownFrameRates.push_back(mode->getPeakFps());
+    }
+
+    // Sort and remove duplicates.
+    std::sort(knownFrameRates.begin(), knownFrameRates.end(), isStrictlyLess);
+    knownFrameRates.erase(std::unique(knownFrameRates.begin(), knownFrameRates.end(),
+                                      isApproxEqual),
+                          knownFrameRates.end());
+    return knownFrameRates;
 }
 
 std::vector<DisplayModeIterator> sortByRefreshRate(const DisplayModes& modes) {
@@ -405,10 +417,61 @@ float RefreshRateSelector::calculateDistanceScoreFromMaxLocked(Fps refreshRate) 
 
 float RefreshRateSelector::calculateLayerScoreLocked(const LayerRequirement& layer, Fps refreshRate,
                                                      bool isSeamlessSwitch) const {
-    (void)layer;
-    (void)refreshRate;
-    (void)isSeamlessSwitch;
-    return 1.0f;
+    // Slightly prefer seamless switches.
+    constexpr float kSeamedSwitchPenalty = 0.95f;
+    const float seamlessness = isSeamlessSwitch ? 1.0f : kSeamedSwitchPenalty;
+
+    if (layer.vote == LayerVoteType::ExplicitCategory) {
+        // HighHint is considered later for touch boost.
+        if (layer.frameRateCategory == FrameRateCategory::HighHint) {
+            return 0.f;
+        }
+
+        if (getFrameRateCategoryRange(layer.frameRateCategory).includes(refreshRate)) {
+            return 1.f;
+        }
+
+        FpsRange categoryRange = getFrameRateCategoryRange(layer.frameRateCategory);
+        using fps_approx_ops::operator<;
+        if (refreshRate < categoryRange.min) {
+            return calculateNonExactMatchingDefaultLayerScoreLocked(refreshRate.getPeriodNsecs(),
+                                                                    categoryRange.min
+                                                                            .getPeriodNsecs());
+        }
+        return calculateNonExactMatchingDefaultLayerScoreLocked(refreshRate.getPeriodNsecs(),
+                                                                categoryRange.max.getPeriodNsecs());
+    }
+
+    // If the layer wants Max, give higher score to the higher refresh rate
+    if (layer.vote == LayerVoteType::Max) {
+        return calculateDistanceScoreFromMaxLocked(refreshRate);
+    }
+
+    if (layer.vote == LayerVoteType::ExplicitExact) {
+        const int divisor = getFrameRateDivisor(refreshRate, layer.desiredRefreshRate);
+        if (supportsAppFrameRateOverrideByContent()) {
+            // Since we support frame rate override, allow refresh rates which are
+            // multiples of the layer's request, as those apps would be throttled
+            // down to run at the desired refresh rate.
+            return divisor > 0;
+        }
+
+        return divisor == 1;
+    }
+
+    // If the layer frame rate is a divisor of the refresh rate it should score
+    // the highest score.
+    if (layer.desiredRefreshRate.isValid() &&
+        getFrameRateDivisor(refreshRate, layer.desiredRefreshRate) > 0) {
+        return 1.0f * seamlessness;
+    }
+
+    // The layer frame rate is not a divisor of the refresh rate,
+    // there is a small penalty attached to the score to favor the frame rates
+    // the exactly matches the display refresh rate or a multiple.
+    constexpr float kNonExactMatchingPenalty = 0.95f;
+    return calculateNonExactMatchingLayerScoreLocked(layer, refreshRate) * seamlessness *
+            kNonExactMatchingPenalty;
 }
 
 auto RefreshRateSelector::getRankedFrameRates(const std::vector<LayerRequirement>& layers,
@@ -444,31 +507,653 @@ PerUidLayerRequirements groupLayersByUid(
 auto RefreshRateSelector::getRankedFrameRatesLocked(const std::vector<LayerRequirement>& layers,
                                                     GlobalSignals signals, Fps pacesetterFps) const
         -> RankedFrameRates {
-    (void)layers;
-    (void)signals;
-    (void)pacesetterFps;
-
-    FrameRateRanking ranking;
+    using namespace fps_approx_ops;
+    SFTRACE_CALL();
+    ALOGV("%s: %zu layers, signals: %s", __func__, layers.size(), signals.toString().c_str());
 
     const auto& activeMode = *getActiveModeLocked().modePtr;
+    FrameRateRanking ranking;
 
-    ranking.emplace_back(ScoredFrameRate{
-        FrameRateMode{activeMode.getPeakFps(), ftl::as_non_null(mDisplayModes.get(activeMode.getId())->get())},
-        1.0f
+    if (pacesetterFps.isValid()) {
+        ALOGV("Follower display");
+
+        const auto ranking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Descending,
+                                            std::nullopt, [&](FrameRateMode mode) {
+                                                return mode.modePtr->getPeakFps() == pacesetterFps;
+                                            });
+
+        if (!ranking.empty()) {
+            SFTRACE_FORMAT_INSTANT("%s (Follower display)",
+                                   to_string(ranking.front().frameRateMode.fps).c_str());
+
+            return {ranking, kNoSignals, pacesetterFps};
+        }
+
+        ALOGW("Follower display cannot follow the pacesetter");
+    }
+
+    // Keep the display at max frame rate for the duration of powering on the display.
+    if (signals.powerOnImminent) {
+        ALOGV("Power On Imminent");
+        ranking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Descending);
+        SFTRACE_FORMAT_INSTANT("%s (Power On Imminent)",
+                               to_string(ranking.front().frameRateMode.fps).c_str());
+        return {ranking, GlobalSignals{.powerOnImminent = true}};
+    }
+
+    // A method for UI Toolkit to send the touch signal via "HighHint" category vote,
+    // which will touch boost when there are no ExplicitDefault layer votes on the app.
+    // At most one app can have the "HighHint" touch boost vote at a time.
+    // This accounts for cases such as games that use `setFrameRate`
+    // with Default compatibility to limit the frame rate and disabling touch boost.
+    bool isAppTouchBoost = false;
+    const auto layersByUid = groupLayersByUid(layers);
+    for (const auto& [uid, layersWithSameUid] : layersByUid) {
+        bool hasHighHint = false;
+        bool hasExplicitDefault = false;
+        for (const auto& layer : layersWithSameUid) {
+            switch (layer->vote) {
+                case LayerVoteType::ExplicitDefault:
+                    hasExplicitDefault = true;
+                    break;
+                case LayerVoteType::ExplicitCategory:
+                    if (layer->frameRateCategory == FrameRateCategory::HighHint) {
+                        hasHighHint = true;
+                    }
+                    break;
+                default:
+                    // No action
+                    break;
+            }
+            if (hasHighHint && hasExplicitDefault) {
+                break;
+            }
+        }
+
+        if (hasHighHint && !hasExplicitDefault) {
+            // Focused app has touch signal (HighHint) and no frame rate ExplicitDefault votes
+            // (which prevents touch boost due to games use case).
+            isAppTouchBoost = true;
+            break;
+        }
+    }
+
+    int noVoteLayers = 0;
+    // Layers that prefer the same mode ("no-op").
+    int noPreferenceLayers = 0;
+    int minVoteLayers = 0;
+    int maxVoteLayers = 0;
+    int explicitDefaultVoteLayers = 0;
+    int explicitExactOrMultipleVoteLayers = 0;
+    int explicitExact = 0;
+    int explicitGteLayers = 0;
+    int explicitCategoryVoteLayers = 0;
+    int seamedFocusedLayers = 0;
+    int categorySmoothSwitchOnlyLayers = 0;
+
+    static bool localIsIdle;
+
+    for (const auto& layer : layers) {
+        switch (layer.vote) {
+            case LayerVoteType::NoVote:
+                noVoteLayers++;
+                break;
+            case LayerVoteType::Min:
+                minVoteLayers++;
+                break;
+            case LayerVoteType::Max:
+                maxVoteLayers++;
+                break;
+            case LayerVoteType::ExplicitDefault:
+                explicitDefaultVoteLayers++;
+                break;
+            case LayerVoteType::ExplicitExactOrMultiple:
+                explicitExactOrMultipleVoteLayers++;
+                break;
+            case LayerVoteType::ExplicitExact:
+                explicitExact++;
+                break;
+            case LayerVoteType::ExplicitGte:
+                explicitGteLayers++;
+                break;
+            case LayerVoteType::ExplicitCategory:
+                // HighHint does not count as an explicit signal from an app. It is a touch signal
+                // sent from UI Toolkit.
+                if (layer.frameRateCategory != FrameRateCategory::HighHint) {
+                    explicitCategoryVoteLayers++;
+                }
+                if (layer.frameRateCategory == FrameRateCategory::NoPreference) {
+                    noPreferenceLayers++;
+                }
+                break;
+            case LayerVoteType::Heuristic:
+                break;
+        }
+
+        if (layer.seamlessness == Seamlessness::SeamedAndSeamless && layer.focused) {
+            seamedFocusedLayers++;
+        }
+        if (layer.frameRateCategorySmoothSwitchOnly) {
+            categorySmoothSwitchOnlyLayers++;
+        }
+    }
+
+    const bool hasExplicitVoteLayers = explicitDefaultVoteLayers > 0 ||
+            explicitExactOrMultipleVoteLayers > 0 || explicitExact > 0 || explicitGteLayers > 0 ||
+            explicitCategoryVoteLayers > 0;
+
+    const Policy* policy = getCurrentPolicyLocked();
+    const auto& defaultMode = mDisplayModes.get(policy->defaultMode)->get();
+
+    // If the default mode group is different from the group of current mode,
+    // this means a layer requesting a seamed mode switch just disappeared and
+    // we should switch back to the default group.
+    // However if a seamed layer is still present we anchor around the group
+    // of the current mode, in order to prevent unnecessary seamed mode switches
+    // (e.g. when pausing a video playback).
+    const auto anchorGroup =
+            seamedFocusedLayers > 0 ? activeMode.getGroup() : defaultMode->getGroup();
+
+    const auto selectivelyForceIdle = [&]() REQUIRES(mLock) -> RankedFrameRates {
+        ALOGV("selectivelyForceIdle(): localIsIdle: %d, hasExplicitVoteLayers: %d",
+                localIsIdle, hasExplicitVoteLayers);
+
+        if (localIsIdle && !hasExplicitVoteLayers && ranking.front().frameRateMode.fps > mIdleFps) {
+            /*
+             * We heavily rely on touch to boost higher than 60 fps.
+             * Fallback to idle fps if a higher fps was calculated.
+             */
+            auto idleRanking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Ascending);
+            // Find the idle mode in the ranking
+            const auto it = std::find_if(idleRanking.begin(), idleRanking.end(),
+                                   [&](const ScoredFrameRate& sfr) {
+                                       return isApproxEqual(sfr.frameRateMode.fps, mIdleFps);
+                                   });
+            if (it != idleRanking.end()) {
+                idleRanking = FrameRateRanking{*it};
+                ALOGV("Forcing idle");
+            }
+            // Otherwise return the idle ranking as it is
+            ALOGV("%s scored", to_string(idleRanking.front().frameRateMode.fps).c_str());
+            return {idleRanking, GlobalSignals{.idle = true}};
+        }
+
+        // Handle the case where we don't force idle or bestRefreshRate is not available
+        ALOGV("%s scored", to_string(ranking.front().frameRateMode.fps).c_str());
+        return {ranking, kNoSignals};
+    };
+
+    // Consider the touch event if there are no Explicit* layers. Otherwise wait until after we've
+    // selected a refresh rate to see if we should apply touch boost.
+    if (signals.touch && !hasExplicitVoteLayers) {
+        ALOGV("Touch Boost");
+        ranking = rankFrameRates(anchorGroup, RefreshRateOrder::Descending);
+        SFTRACE_FORMAT_INSTANT("%s (Touch Boost)",
+                               to_string(ranking.front().frameRateMode.fps).c_str());
+        localIsIdle = false;
+        return {ranking, GlobalSignals{.touch = true}};
+    }
+
+    // If the primary range consists of a single refresh rate then we can only
+    // move out the of range if layers explicitly request a different refresh
+    // rate.
+    if (!signals.touch && signals.idle &&
+        !(policy->primaryRangeIsSingleRate() && hasExplicitVoteLayers)) {
+        ALOGV("Idle");
+        ranking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Ascending);
+        SFTRACE_FORMAT_INSTANT("%s (Idle)", to_string(ranking.front().frameRateMode.fps).c_str());
+        localIsIdle = true;
+        return selectivelyForceIdle();
+    }
+
+    // If there are no layers, prefer to stay with the current config
+    if (layers.empty() || noVoteLayers == layers.size()) {
+        ALOGV("No layers with votes");
+        ranking = rankFrameRates(anchorGroup, RefreshRateOrder::Ascending, activeMode.getId());
+        SFTRACE_FORMAT_INSTANT("%s (No layers with votes)",
+                               to_string(ranking.front().frameRateMode.fps).c_str());
+        // If all layers have no vote, consider the heuristic idle scenario
+        if (signals.heuristicIdle) {
+            localIsIdle = true;
+        }
+        return selectivelyForceIdle();
+    }
+
+    // If all layers are category NoPreference, use the current config.
+    if (noPreferenceLayers + noVoteLayers == layers.size()) {
+        ALOGV("All layers NoPreference");
+        constexpr float kScore = std::numeric_limits<float>::max();
+        FrameRateRanking currentMode;
+        currentMode.emplace_back(ScoredFrameRate{getActiveModeLocked(), kScore});
+        SFTRACE_FORMAT_INSTANT("%s (All layers NoPreference)",
+                              to_string(currentMode.front().frameRateMode.fps).c_str());
+        return {currentMode, kNoSignals};
+    }
+
+    const bool smoothSwitchOnly = categorySmoothSwitchOnlyLayers > 0;
+    const DisplayModeId activeModeId = activeMode.getId();
+
+    // Only if all layers want Min we should return Min
+    if (noVoteLayers + minVoteLayers == layers.size()) {
+        ALOGV("All layers Min");
+        ranking = rankFrameRates(activeMode.getGroup(), RefreshRateOrder::Ascending,
+                                            std::nullopt, [&](FrameRateMode mode) {
+                                                return !smoothSwitchOnly ||
+                                                        mode.modePtr->getId() == activeModeId;
+                                            });
+        SFTRACE_FORMAT_INSTANT("%s (All layers Min)",
+                               to_string(ranking.front().frameRateMode.fps).c_str());
+        // If all layers have min vote, consider the heuristic idle scenario
+        if (signals.heuristicIdle) {
+            localIsIdle = true;
+        }
+        return selectivelyForceIdle();
+    }
+
+    // Find the best refresh rate based on score
+    std::vector<RefreshRateScore> scores;
+    scores.reserve(mAppRequestFrameRates.size());
+
+    for (const FrameRateMode& it : mAppRequestFrameRates) {
+        scores.emplace_back(RefreshRateScore{it, 0.0f});
+    }
+
+    for (const auto& layer : layers) {
+        ALOGV("Calculating score for %s (%s, weight %.2f, desired %.2f, category %s) ",
+              layer.name.c_str(), ftl::enum_string(layer.vote).c_str(), layer.weight,
+              layer.desiredRefreshRate.getValue(),
+              ftl::enum_string(layer.frameRateCategory).c_str());
+        if (layer.isNoVote() || layer.frameRateCategory == FrameRateCategory::NoPreference ||
+            layer.vote == LayerVoteType::Min) {
+            ALOGV("%s scoring skipped due to vote", formatLayerInfo(layer, layer.weight).c_str());
+            continue;
+        }
+
+        const auto weight = layer.weight;
+
+        for (auto& [mode, overallScore, fixedRateBelowThresholdLayersScore] : scores) {
+            const auto& [fps, modePtr] = mode;
+            const bool isSeamlessSwitch = modePtr->getGroup() == activeMode.getGroup();
+
+            if (layer.seamlessness == Seamlessness::OnlySeamless && !isSeamlessSwitch) {
+                ALOGV("%s ignores %s to avoid non-seamless switch. Current mode = %s",
+                      formatLayerInfo(layer, weight).c_str(), to_string(*modePtr).c_str(),
+                      to_string(activeMode).c_str());
+                continue;
+            }
+
+            if (layer.seamlessness == Seamlessness::SeamedAndSeamless && !isSeamlessSwitch &&
+                !layer.focused) {
+                ALOGV("%s ignores %s because it's not focused and the switch is going to be seamed."
+                      " Current mode = %s",
+                      formatLayerInfo(layer, weight).c_str(), to_string(*modePtr).c_str(),
+                      to_string(activeMode).c_str());
+                continue;
+            }
+
+            if (smoothSwitchOnly && modePtr->getId() != activeModeId) {
+                ALOGV("%s ignores %s because it's non-VRR and smooth switch only."
+                      " Current mode = %s",
+                      formatLayerInfo(layer, weight).c_str(), to_string(*modePtr).c_str(),
+                      to_string(activeMode).c_str());
+                continue;
+            }
+
+            // Layers with default seamlessness vote for the current mode group if
+            // there are layers with seamlessness=SeamedAndSeamless and for the default
+            // mode group otherwise. In second case, if the current mode group is different
+            // from the default, this means a layer with seamlessness=SeamedAndSeamless has just
+            // disappeared.
+            const bool isInPolicyForDefault = modePtr->getGroup() == anchorGroup;
+            if (layer.seamlessness == Seamlessness::Default && !isInPolicyForDefault) {
+                ALOGV("%s ignores %s. Current mode = %s", formatLayerInfo(layer, weight).c_str(),
+                      to_string(*modePtr).c_str(), to_string(activeMode).c_str());
+                continue;
+            }
+
+            const bool inPrimaryPhysicalRange =
+                    policy->primaryRanges.physical.includes(modePtr->getPeakFps());
+            const bool inPrimaryRenderRange = policy->primaryRanges.render.includes(fps);
+            if (((policy->primaryRangeIsSingleRate() && !inPrimaryPhysicalRange) ||
+                 !inPrimaryRenderRange) &&
+                !(layer.focused &&
+                  (layer.vote == LayerVoteType::ExplicitDefault ||
+                   layer.vote == LayerVoteType::ExplicitExact))) {
+                // Only focused layers with ExplicitDefault frame rate settings are allowed to score
+                // refresh rates outside the primary range.
+                continue;
+            }
+
+            if (layer.vote == LayerVoteType::Heuristic && signals.heuristicIdle && fps > 60_Hz) {
+                // Time for heuristic layer to keep using high refresh rate has expired
+                localIsIdle = true;
+                ALOGV("%s expired to keep using %s", formatLayerInfo(layer, weight).c_str(),
+                      to_string(fps).c_str());
+                continue;
+            }
+
+            const float layerScore = calculateLayerScoreLocked(layer, fps, isSeamlessSwitch);
+            const float weightedLayerScore = weight * layerScore;
+
+            // Layer with fixed source has a special consideration which depends on the
+            // mConfig.frameRateMultipleThreshold. We don't want these layers to score
+            // refresh rates above the threshold, but we also don't want to favor the lower
+            // ones by having a greater number of layers scoring them. Instead, we calculate
+            // the score independently for these layers and later decide which
+            // refresh rates to add it. For example, desired 24 fps with 120 Hz threshold should not
+            // score 120 Hz, but desired 60 fps should contribute to the score.
+            const bool fixedSourceLayer = [](LayerVoteType vote) {
+                switch (vote) {
+                    case LayerVoteType::ExplicitExactOrMultiple:
+                    case LayerVoteType::Heuristic:
+                        return true;
+                    case LayerVoteType::NoVote:
+                    case LayerVoteType::Min:
+                    case LayerVoteType::Max:
+                    case LayerVoteType::ExplicitDefault:
+                    case LayerVoteType::ExplicitExact:
+                    case LayerVoteType::ExplicitGte:
+                    case LayerVoteType::ExplicitCategory:
+                        return false;
+                }
+            }(layer.vote);
+            const bool layerBelowThreshold = mConfig.frameRateMultipleThreshold != 0 &&
+                    layer.desiredRefreshRate <
+                            Fps::fromValue(mConfig.frameRateMultipleThreshold / 2);
+            if (fixedSourceLayer && layerBelowThreshold) {
+                const bool modeAboveThreshold =
+                        modePtr->getPeakFps() >= Fps::fromValue(mConfig.frameRateMultipleThreshold);
+                if (modeAboveThreshold) {
+                    ALOGV("%s gives %s (%s(%s)) fixed source (above threshold) score of %.4f",
+                          formatLayerInfo(layer, weight).c_str(), to_string(fps).c_str(),
+                          to_string(modePtr->getPeakFps()).c_str(),
+                          to_string(modePtr->getVsyncRate()).c_str(), layerScore);
+                    fixedRateBelowThresholdLayersScore.modeAboveThreshold += weightedLayerScore;
+                } else {
+                    ALOGV("%s gives %s (%s(%s)) fixed source (below threshold) score of %.4f",
+                          formatLayerInfo(layer, weight).c_str(), to_string(fps).c_str(),
+                          to_string(modePtr->getPeakFps()).c_str(),
+                          to_string(modePtr->getVsyncRate()).c_str(), layerScore);
+                    fixedRateBelowThresholdLayersScore.modeBelowThreshold += weightedLayerScore;
+                }
+            } else {
+                ALOGV("%s gives %s (%s(%s)) score of %.4f", formatLayerInfo(layer, weight).c_str(),
+                      to_string(fps).c_str(), to_string(modePtr->getPeakFps()).c_str(),
+                      to_string(modePtr->getVsyncRate()).c_str(), layerScore);
+                overallScore += weightedLayerScore;
+            }
+        }
+    }
+
+    // We want to find the best refresh rate without the fixed source layers,
+    // so we could know whether we should add the modeAboveThreshold scores or not.
+    // If the best refresh rate is already above the threshold, it means that
+    // some non-fixed source layers already scored it, so we can just add the score
+    // for all fixed source layers, even the ones that are above the threshold.
+    const bool maxScoreAboveThreshold = [&] {
+        if (mConfig.frameRateMultipleThreshold == 0 || scores.empty()) {
+            return false;
+        }
+
+        const auto maxScoreIt =
+                std::max_element(scores.begin(), scores.end(),
+                                 [](RefreshRateScore max, RefreshRateScore current) {
+                                     return current.overallScore > max.overallScore;
+                                 });
+        ALOGV("%s (%s(%s)) is the best refresh rate without fixed source layers. It is %s the "
+              "threshold for "
+              "refresh rate multiples",
+              to_string(maxScoreIt->frameRateMode.fps).c_str(),
+              to_string(maxScoreIt->frameRateMode.modePtr->getPeakFps()).c_str(),
+              to_string(maxScoreIt->frameRateMode.modePtr->getVsyncRate()).c_str(),
+              maxScoreAboveThreshold ? "above" : "below");
+        return maxScoreIt->frameRateMode.modePtr->getPeakFps() >=
+                Fps::fromValue(mConfig.frameRateMultipleThreshold);
+    }();
+
+    // Now we can add the fixed rate layers score
+    for (auto& [frameRateMode, overallScore, fixedRateBelowThresholdLayersScore] : scores) {
+        overallScore += fixedRateBelowThresholdLayersScore.modeBelowThreshold;
+        if (maxScoreAboveThreshold) {
+            overallScore += fixedRateBelowThresholdLayersScore.modeAboveThreshold;
+        }
+        ALOGV("%s (%s(%s)) adjusted overallScore is %.4f", to_string(frameRateMode.fps).c_str(),
+              to_string(frameRateMode.modePtr->getPeakFps()).c_str(),
+              to_string(frameRateMode.modePtr->getVsyncRate()).c_str(), overallScore);
+    }
+
+    // Now that we scored all the refresh rates we need to pick the one that got the highest
+    // overallScore. Sort the scores based on their overallScore in descending order of priority.
+    const RefreshRateOrder refreshRateOrder =
+            maxVoteLayers > 0 ? RefreshRateOrder::Descending : RefreshRateOrder::Ascending;
+    std::sort(scores.begin(), scores.end(),
+              RefreshRateScoreComparator{.refreshRateOrder = refreshRateOrder});
+
+    ranking.reserve(scores.size());
+
+    std::transform(scores.begin(), scores.end(), back_inserter(ranking),
+                   [](const RefreshRateScore& score) {
+                       return ScoredFrameRate{score.frameRateMode, score.overallScore};
+                   });
+
+    const bool noLayerScore = std::all_of(scores.begin(), scores.end(), [](RefreshRateScore score) {
+        return score.overallScore == 0;
     });
 
-    return {ranking, kNoSignals};
+    // TODO(b/364651864): Evaluate correctness of primaryRangeIsSingleRate.
+    if (!mIsVrrDevice.load() && policy->primaryRangeIsSingleRate()) {
+        // If we never scored any layers, then choose the rate from the primary
+        // range instead of picking a random score from the app range.
+        if (noLayerScore) {
+            ALOGV("Layers not scored");
+            const auto descending = rankFrameRates(anchorGroup, RefreshRateOrder::Descending);
+            SFTRACE_FORMAT_INSTANT("%s (Layers not scored)",
+                                   to_string(descending.front().frameRateMode.fps).c_str());
+            return {descending, kNoSignals};
+        } else {
+            ALOGV("primaryRangeIsSingleRate");
+            SFTRACE_FORMAT_INSTANT("%s (primaryRangeIsSingleRate)",
+                                   to_string(ranking.front().frameRateMode.fps).c_str());
+            return {ranking, kNoSignals};
+        }
+    }
+
+    // Consider the touch event if there are no ExplicitDefault layers. ExplicitDefault are mostly
+    // interactive (as opposed to ExplicitExactOrMultiple) and therefore if those posted an explicit
+    // vote we should not change it if we get a touch event. Only apply touch boost if it will
+    // actually increase the refresh rate over the normal selection.
+    const auto isTouchBoostForExplicitExact = [&]() -> bool {
+        if (supportsAppFrameRateOverrideByContent()) {
+            // Enable touch boost if there are other layers besides exact
+            return explicitExact + noVoteLayers + explicitGteLayers != layers.size();
+        } else {
+            // Enable touch boost if there are no exact layers
+            return explicitExact == 0;
+        }
+    };
+
+    const auto isTouchBoostForCategory = [&]() -> bool {
+        return explicitCategoryVoteLayers + noVoteLayers + explicitGteLayers != layers.size();
+    };
+
+    // This accounts for cases such as games that use `setFrameRate` with Default
+    // compatibility to limit the frame rate, which should not have touch boost.
+    const bool isLateGlobalTouchBoost = signals.touch && explicitDefaultVoteLayers == 0;
+    const bool isLateTouchBoost = isLateGlobalTouchBoost || isAppTouchBoost;
+    if (isLateTouchBoost && isTouchBoostForExplicitExact() && isTouchBoostForCategory()) {
+        const auto touchRefreshRates = rankFrameRates(anchorGroup, RefreshRateOrder::Descending);
+
+        if (scores.front().frameRateMode.fps <= touchRefreshRates.front().frameRateMode.fps) {
+            ALOGV("Touch Boost [late]");
+            SFTRACE_FORMAT_INSTANT("%s (Touch Boost [late])",
+                                   to_string(touchRefreshRates.front().frameRateMode.fps).c_str());
+            return {touchRefreshRates, GlobalSignals{.touch = true}};
+        }
+    }
+
+    // If we never scored any layers, and we don't favor high refresh rates, prefer to stay with the
+    // current config
+    if (noLayerScore && refreshRateOrder == RefreshRateOrder::Ascending) {
+        ALOGV("preferredDisplayMode");
+        const auto ascendingWithPreferred =
+                rankFrameRates(anchorGroup, RefreshRateOrder::Ascending, activeMode.getId());
+        SFTRACE_FORMAT_INSTANT("%s (preferredDisplayMode)",
+                               to_string(ascendingWithPreferred.front().frameRateMode.fps).c_str());
+        return {ascendingWithPreferred, kNoSignals};
+    }
+
+    // Prevent forced idle if we have a max vote layer
+    if (maxVoteLayers > 0 && localIsIdle) {
+        ALOGV("Max vote layer present, do not idle");
+        localIsIdle = false;
+    }
+
+    ALOGV("%s (scored)", to_string(ranking.front().frameRateMode.fps).c_str());
+    SFTRACE_FORMAT_INSTANT("%s (scored)", to_string(ranking.front().frameRateMode.fps).c_str());
+    return selectivelyForceIdle();
 }
 
 auto RefreshRateSelector::getFrameRateOverrides(const std::vector<LayerRequirement>& layers,
                                                 Fps displayRefreshRate,
                                                 GlobalSignals globalSignals) const
         -> UidToFrameRateOverride {
-    (void)layers;
-    (void)displayRefreshRate;
-    (void)globalSignals;
+    SFTRACE_CALL();
+    if (mConfig.enableFrameRateOverride == Config::FrameRateOverride::Disabled) {
+        return {};
+    }
 
-    return {};
+    ALOGV("%s: %zu layers", __func__, layers.size());
+    std::lock_guard lock(mLock);
+
+    const auto* policyPtr = getCurrentPolicyLocked();
+    // We don't want to run lower than 30fps
+    // TODO(b/297600226): revise this for dVRR
+    const Fps minFrameRate = std::max(policyPtr->appRequestRanges.render.min, 30_Hz, isApproxLess);
+
+    using fps_approx_ops::operator/;
+    const unsigned numMultiples = displayRefreshRate / minFrameRate;
+
+    std::vector<std::pair<Fps, float>> scoredFrameRates;
+    scoredFrameRates.reserve(numMultiples);
+
+    for (unsigned n = numMultiples; n > 0; n--) {
+        const Fps divisor = displayRefreshRate / n;
+        if (mConfig.enableFrameRateOverride ==
+                    Config::FrameRateOverride::AppOverrideNativeRefreshRates &&
+            !isNativeRefreshRate(divisor)) {
+            continue;
+        }
+
+        if (policyPtr->appRequestRanges.render.includes(divisor)) {
+            ALOGV("%s: adding %s as a potential frame rate", __func__, to_string(divisor).c_str());
+            scoredFrameRates.emplace_back(divisor, 0);
+        }
+    }
+
+    const auto layersByUid = groupLayersByUid(layers);
+    UidToFrameRateOverride frameRateOverrides;
+    for (const auto& [uid, layersWithSameUid] : layersByUid) {
+        // Look for cases that should not have frame rate overrides.
+        bool hasExplicitExactOrMultiple = false;
+        bool hasExplicitDefault = false;
+        bool hasHighHint = false;
+        bool hasSkipOverrideLayer = false;
+        for (const auto& layer : layersWithSameUid) {
+            switch (layer->vote) {
+                case LayerVoteType::ExplicitExactOrMultiple:
+                    hasExplicitExactOrMultiple = true;
+                    break;
+                case LayerVoteType::ExplicitDefault:
+                    hasExplicitDefault = true;
+                    break;
+                case LayerVoteType::ExplicitCategory:
+                    if (layer->frameRateCategory == FrameRateCategory::HighHint) {
+                        hasHighHint = true;
+                    }
+                    break;
+                case LayerVoteType::Max:
+                case LayerVoteType::Heuristic:
+                    hasSkipOverrideLayer = true;
+                    break;
+                default:
+                    // No action
+                    break;
+            }
+            if (hasExplicitExactOrMultiple && hasExplicitDefault && hasHighHint &&
+                hasSkipOverrideLayer) {
+                break;
+            }
+        }
+
+        if (hasSkipOverrideLayer) {
+            ALOGV("%s: Skipping due to vote(s): uid=%d", __func__, uid);
+            continue;
+        }
+
+        // Layers with ExplicitExactOrMultiple expect touch boost
+        if (globalSignals.touch && hasExplicitExactOrMultiple) {
+            continue;
+        }
+
+        // Mirrors getRankedFrameRates. If there is no ExplicitDefault, expect touch boost and
+        // skip frame rate override.
+        if (hasHighHint && !hasExplicitDefault) {
+            continue;
+        }
+
+        for (auto& [_, score] : scoredFrameRates) {
+            score = 0;
+        }
+
+        for (const auto& layer : layersWithSameUid) {
+            if (layer->isNoVote() || layer->frameRateCategory == FrameRateCategory::NoPreference ||
+                layer->vote == LayerVoteType::Min) {
+                continue;
+            }
+
+            LOG_ALWAYS_FATAL_IF(layer->vote != LayerVoteType::ExplicitDefault &&
+                                        layer->vote != LayerVoteType::ExplicitExactOrMultiple &&
+                                        layer->vote != LayerVoteType::ExplicitExact &&
+                                        layer->vote != LayerVoteType::ExplicitGte &&
+                                        layer->vote != LayerVoteType::ExplicitCategory,
+                                "Invalid layer vote type for frame rate overrides");
+            for (auto& [fps, score] : scoredFrameRates) {
+                constexpr bool isSeamlessSwitch = true;
+                const auto layerScore = calculateLayerScoreLocked(*layer, fps, isSeamlessSwitch);
+                score += layer->weight * layerScore;
+            }
+        }
+
+        // If we never scored any layers, we don't have a preferred frame rate
+        if (std::all_of(scoredFrameRates.begin(), scoredFrameRates.end(),
+                        [](const auto& scoredFrameRate) {
+                            const auto [_, score] = scoredFrameRate;
+                            return score == 0;
+                        })) {
+            continue;
+        }
+
+        // Now that we scored all the refresh rates we need to pick the lowest refresh rate
+        // that got the highest score.
+        const auto [overrideFps, _] =
+                *std::max_element(scoredFrameRates.begin(), scoredFrameRates.end(),
+                                  [](const auto& lhsPair, const auto& rhsPair) {
+                                      const float lhs = lhsPair.second;
+                                      const float rhs = rhsPair.second;
+                                      return lhs < rhs && !ScoredFrameRate::scoresEqual(lhs, rhs);
+                                  });
+        ALOGV("%s: overriding to %s for uid=%d", __func__, to_string(overrideFps).c_str(), uid);
+        SFTRACE_FORMAT_INSTANT("%s: overriding to %s for uid=%d", __func__,
+                               to_string(overrideFps).c_str(), uid);
+        if (SFTRACE_ENABLED() && FlagManager::getInstance().trace_frame_rate_override()) {
+            std::stringstream ss;
+            ss << "FrameRateOverride " << uid;
+            SFTRACE_INT(ss.str().c_str(), overrideFps.getIntValue());
+        }
+        frameRateOverrides.emplace(uid, overrideFps);
+    }
+
+    return frameRateOverrides;
 }
 
 ftl::Optional<FrameRateMode> RefreshRateSelector::onKernelTimerChanged(
@@ -916,7 +1601,7 @@ void RefreshRateSelector::constructAvailableRefreshRates() {
 }
 
 bool RefreshRateSelector::isVrrDevice() const {
-    return false;
+    return mIsVrrDevice;
 }
 
 Fps RefreshRateSelector::findClosestKnownFrameRate(Fps frameRate) const {
@@ -960,7 +1645,31 @@ FpsRange RefreshRateSelector::getSupportedFrameRateRangeLocked() const {
 }
 
 auto RefreshRateSelector::getIdleTimerAction() const -> KernelIdleTimerAction {
-    return KernelIdleTimerAction::TurnOff;
+    std::lock_guard lock(mLock);
+
+    const Fps deviceMinFps = mMinRefreshRateModeIt->second->getPeakFps();
+    const DisplayModePtr& minByPolicy = getMinRefreshRateByPolicyLocked();
+
+    // Kernel idle timer will set the refresh rate to the device min. If DisplayManager says that
+    // the min allowed refresh rate is higher than the device min, we do not want to enable the
+    // timer.
+    if (isStrictlyLess(deviceMinFps, minByPolicy->getPeakFps())) {
+        return KernelIdleTimerAction::TurnOff;
+    }
+
+    const DisplayModePtr& maxByPolicy =
+            getMaxRefreshRateByPolicyLocked(getActiveModeLocked().modePtr->getGroup());
+    if (minByPolicy == maxByPolicy) {
+        // Turn on the timer when the min of the primary range is below the device min.
+        if (const Policy* currentPolicy = getCurrentPolicyLocked();
+            isApproxLess(currentPolicy->primaryRanges.physical.min, deviceMinFps)) {
+            return KernelIdleTimerAction::TurnOn;
+        }
+        return KernelIdleTimerAction::TurnOff;
+    }
+
+    // Turn on the timer in all other cases.
+    return KernelIdleTimerAction::TurnOn;
 }
 
 int RefreshRateSelector::getFrameRateDivisor(Fps displayRefreshRate, Fps layerFrameRate) {
@@ -1028,7 +1737,10 @@ void RefreshRateSelector::dump(utils::Dumper& dumper) const {
 }
 
 std::chrono::milliseconds RefreshRateSelector::getIdleTimerTimeout() {
-    return 0ms;
+    if (FlagManager::getInstance().idle_screen_refresh_rate_timeout() && mIdleTimer) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(mIdleTimer->interval());
+    }
+    return mConfig.legacyIdleTimerTimeout;
 }
 
 // TODO(b/293651105): Extract category FpsRange mapping to OEM-configurable config.
